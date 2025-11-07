@@ -1,0 +1,214 @@
+name: co2kernel_release
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      CO2K_VER:
+        description: "co2kernel version"
+        required: true
+        default: "v0.0.0_*"
+      KERNEL_NAME:
+        description: "自定义 Linux version"
+        required: true
+        default: "-android13-8-o-01144-g8e1bc9d233a1"
+      UTS_VERSION:
+        description: "自定义 UTS_VERSION 时间戳"
+        required: true
+        default: "#1 SMP PREEMPT Thu Sep 4 03:07:39 UTC 2025"
+
+jobs:
+  build:
+    name: Build (${{ matrix.variant }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        variant: [default, susfs, lxc, iosched-none, no-KSU, no-enforcing-120Hz]
+      max-parallel: 2
+
+    steps:
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 8192
+          temp-reserve-mb: 2048
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "DogEZ"
+          git config --global user.email "DdogezD@gmail.com"
+
+      - name: Install dependencies
+        run: |
+          sudo apt update && sudo apt install -y python3 git curl zip
+
+      - name: Install repo tool
+        run: |
+          curl https://storage.googleapis.com/git-repo-downloads/repo > ~/repo
+          chmod a+x ~/repo
+          sudo mv ~/repo /usr/local/bin/repo
+
+      - name: Initialize repo and sync
+        run: |
+          mkdir kernel_workspace && cd kernel_workspace
+          repo init -u https://github.com/co2kernel/kernel_manifest.git -b refs/heads/oneplus/sm8550 -m oneplus_open_v.xml --depth=1
+          repo sync
+
+      - name: Add co2kernel features
+        run: |
+          cd kernel_workspace
+          git clone --depth=1 https://github.com/co2kernel/co2kernel_build.git build
+          cd kernel_platform/common
+          cp ../../build/patch/*.patch ./
+          case "${{ matrix.variant }}" in
+            lxc)
+              echo "→ Applying LXC support (will revert defconfig spoofer)"
+              patch -p1 < co2kernel_LXC_support.patch
+              patch -p1 < co2kernel_revert_defconfig_spoofer.patch
+              ;;
+            susfs)
+              echo "→ Applying susfs support (will revert defconfig spoofer)"
+              patch -p1 < co2kernel_revert_defconfig_spoofer.patch
+              ;;
+            iosched-none)
+              echo "→ Applying IO scheduler (none)"
+              patch -p1 < co2kernel_iosched_none.patch
+              ;;
+            no-KSU)
+              echo "→ Removing KernelSU hooks"
+              patch -p1 < co2kernel_revert_kernelsu_hooks.patch
+              ;;
+            no-enforcing-120Hz)
+              echo "→ Removing 120Hz enforcing config"
+              rm -f drivers/of/overwriter/overwrite_configs/22899/120Hz.conf || true
+              ;;
+            *)
+              echo "→ No modification."
+              ;;
+          esac
+
+      - name: Add KernelSU Next latest
+        if: matrix.variant != 'no-KSU'
+        run: |
+          cd kernel_workspace/kernel_platform
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
+          cd ./KernelSU-Next
+          MAKE_FILE="kernel/Makefile"
+          KSU_VERSION=$(($(git rev-list --count HEAD) + 10200))
+          sed -i "s/^DKSU_VERSION.*/DKSU_VERSION=${KSU_VERSION}/" "${MAKE_FILE}"
+
+      - name: Setup overwriter
+        run: |
+          cd kernel_workspace/kernel_platform/common
+          chmod +x ./drivers/of/overwriter/overwrite_configs/convert_configs.sh
+          ./drivers/of/overwriter/overwrite_configs/convert_configs.sh
+          rm -rf ./drivers/of/overwriter/overwrite_configs ./drivers/of/overwriter/tools
+          rm -f ./drivers/of/overwriter/README.md
+
+      - name: Setup susfs
+        if: matrix.variant == 'susfs'
+        run: |
+          cd kernel_workspace
+          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android13-5.15
+          cd kernel_platform
+          cp ../susfs4ksu/kernel_patches/50_add_susfs_in_gki-android13-5.15.patch ./common/
+          cp ../susfs4ksu/kernel_patches/fs/* ./common/fs/
+          cp ../susfs4ksu/kernel_patches/include/linux/* ./common/include/linux/
+          cd ./common
+          patch -p1 < 50_add_susfs_in_gki-android13-5.15.patch || true
+          echo "CONFIG_KSU_SUSFS=y" >> "./arch/arm64/configs/gki_defconfig"
+          echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y" >> "./arch/arm64/configs/gki_defconfig"
+          echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> "./arch/arm64/configs/gki_defconfig"
+          echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> "./arch/arm64/configs/gki_defconfig"
+          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y" >> "./arch/arm64/configs/gki_defconfig"
+          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y" >> "./arch/arm64/configs/gki_defconfig"
+          echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> "./arch/arm64/configs/gki_defconfig"
+          echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=n" >> "./arch/arm64/configs/gki_defconfig"
+          echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> "./arch/arm64/configs/gki_defconfig"
+          echo "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y" >> "./arch/arm64/configs/gki_defconfig"
+          echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> "./arch/arm64/configs/gki_defconfig"
+          echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> "./arch/arm64/configs/gki_defconfig"
+          echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> "./arch/arm64/configs/gki_defconfig"
+          echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> "./arch/arm64/configs/gki_defconfig"
+          echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> "./arch/arm64/configs/gki_defconfig"
+  
+      - name: Spoof Linux version
+        run: |
+          cd kernel_workspace/kernel_platform
+          sed -i '$s|echo "\$res"|echo "\${{ github.event.inputs.KERNEL_NAME }}"|' ./common/scripts/setlocalversion
+          sed -i '/UTS_VERSION=.*cut -b -\$UTS_LEN)/s#UTS_VERSION=.*#UTS_VERSION="\${{ github.event.inputs.UTS_VERSION }}"#' ./common/scripts/mkcompile_h
+
+      - name: Build kernel
+        run: |
+          cd kernel_workspace
+          LTO=thin ./kernel_platform/oplus/build/oplus_build_kernel.sh kalama gki
+
+      - name: Package AnyKernel3
+        run: |
+          git clone https://github.com/co2kernel/AnyKernel3 --depth=1
+          rm -rf ./AnyKernel3/.git
+          cp kernel_workspace/kernel_platform/out/msm-kernel-kalama-gki/dist/Image ./AnyKernel3/
+          cd AnyKernel3
+          zip -r ../co2kernel_${{ matrix.variant }}_ak3.zip ./*
+
+      - name: Upload AnyKernel3
+        uses: actions/upload-artifact@v4
+        with:
+          name: co2kernel_${{ matrix.variant }}_ak3
+          path: co2kernel_${{ matrix.variant }}_ak3.zip
+
+      - name: Download co2kernel readme
+        if: matrix.variant == 'default'
+        run: |
+          mkdir -p readme
+          git clone --depth=1 https://github.com/co2kernel/.github.git readme_repo
+          cp readme_repo/profile/*.md readme/
+          zip -r co2kernel_readme.zip readme/
+
+      - name: Upload co2kernel readme
+        if: matrix.variant == 'default'
+        uses: actions/upload-artifact@v4
+        with:
+          name: co2kernel_readme
+          path: co2kernel_readme.zip
+
+  release:
+    name: Upload to Release
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+        
+      - name: Set date variable
+        run: echo "DATE=UTC-$(date +'%Y-%m-%d')" >> $GITHUB_ENV
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "co2kernel release ${{ github.event.inputs.CO2K_VER }}"
+          tag_name: "${{ github.event.inputs.CO2K_VER }}"
+          body: |
+            ## release ${{ env.DATE }} ${{ github.event.inputs.CO2K_VER }}
+            - `co2kernel_readme.zip`: includes all feature info for this release.
+            - `Source code`: workflow source code. For co2kernel source, visit [github.com/co2kernel](https://github.com/co2kernel).
+            #### release variants
+            - `default`: standard co2kernel.
+            - `lxc`: standard + LXC container support + no defconfig spoofer.
+            - `susfs`: standard + susfs support + no defconfig spoofer.
+            - `no-enforcing-120Hz`: standard + no enforcing 120Hz.
+            - `iosched-none`: standard + enforces `none` for I/O scheduler (faster but laggy on daily usage).
+            - `no-KSU`: standard + no integrated KernelSU-Next & manual hooks.
+            - ***_ak3.zip: AnyKernel3 packages, flash through `Kernel Flasher`**.
+          files: ./artifacts/**/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
